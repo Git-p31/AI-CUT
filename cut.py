@@ -1,123 +1,106 @@
 import streamlit as st
-import yt_dlp
 import os
+import asyncio
+import edge_tts
+import yt_dlp
 import shutil
-import subprocess
-import time
+from moviepy import VideoFileClip, AudioFileClip
 from faster_whisper import WhisperModel
+from deep_translator import GoogleTranslator
 
-# Настройки путей
-VIDEO = "input_video.mp4"
-AUDIO = "temp_audio.wav"
-CLIPS = "output_clips"
+# --- НАСТРОЙКИ ГОЛОСОВ ---
+VOICE_DATA = {
+    "ru": {"Male": "ru-RU-DmitryNeural", "Female": "ru-RU-SvetlanaNeural"},
+    "en": {"Male": "en-US-GuyNeural", "Female": "en-US-JennyNeural"},
+    "de": {"Male": "de-DE-ConradNeural", "Female": "de-DE-KatjaNeural"},
+    "fr": {"Male": "fr-FR-HenriNeural", "Female": "fr-FR-DeniseNeural"},
+    "es": {"Male": "es-ES-AlvaroNeural", "Female": "es-ES-ElviraNeural"}
+}
 
-if "logs" not in st.session_state:
-    st.session_state.logs = "=== Система готова ===\n"
+st.set_page_config(page_title="AI Video Editor", page_icon="🎬", layout="wide")
+st.title("🎬 AI Video Dubbing: Транскрибация и Редактирование")
 
-def add_log(message):
-    timestamp = time.strftime("%H:%M:%S")
-    st.session_state.logs += f"[{timestamp}] {message}\n"
+# Инициализация хранилища текста
+if "translated_text" not in st.session_state:
+    st.session_state.translated_text = ""
 
-@st.cache_resource
-def load_smart_model():
-    return WhisperModel("large-v3-turbo", device="cpu", compute_type="int8")
+# --- UI ---
+st.subheader("1. Загрузка видео")
+col_load1, col_load2 = st.columns(2)
+uploaded_file = col_load1.file_uploader("Загрузите файл", type=["mp4", "mov", "avi"])
+url = col_load2.text_input("ИЛИ ссылка на YouTube")
 
-st.set_page_config(page_title="One-Button AI Clips", page_icon="🎬", layout="wide")
+st.divider()
 
-# --- UI КОНСОЛЬ ---
-with st.expander("🖥️ СТАТУС ОБРАБОТКИ", expanded=True):
-    console_placeholder = st.empty()
-    def update_console():
-        console_placeholder.code(st.session_state.logs, language="bash")
-    update_console()
+st.subheader("2. Параметры")
+c1, c2, c3 = st.columns(3)
+target_lang = c1.selectbox("Язык перевода", list(VOICE_DATA.keys()))
+gender = c2.radio("Пол голоса", ["Male", "Female"], horizontal=True)
+speed = c3.slider("Скорость речи (%)", 80, 150, 100)
 
-# --- ЕДИНАЯ ФУНКЦИЯ ОБРАБОТКИ ---
+VIDEO_PATH = "input_video.mp4"
+VOICEOVER_PATH = "translated_voice.mp3"
+RESULT_PATH = "translated_video.mp4"
 
-def start_full_process(url, clip_len, max_count, user_prompt):
-    try:
-        # 1. СКАЧИВАНИЕ
-        add_log(f"Начинаю загрузку: {url}")
-        update_console()
-        if os.path.exists(VIDEO): os.remove(VIDEO)
-        ydl_opts = {'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]', 'outtmpl': VIDEO, 'merge_output_format': 'mp4'}
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        
-        # 2. АУДИО И ИИ
-        add_log("Загрузка модели и анализ звука...")
-        update_console()
-        model = load_smart_model()
-        if os.path.exists(AUDIO): os.remove(AUDIO)
-        subprocess.run(["ffmpeg", "-i", VIDEO, "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", AUDIO, "-y"], check=True, capture_output=True)
-        
-        segments, _ = model.transcribe(AUDIO, beam_size=5, initial_prompt=user_prompt, vad_filter=True)
-        
-        # 3. ПОИСК МОМЕНТОВ
-        viral_triggers = ["wait", "what", "crazy", "insane", "omg", "look", "wow"]
-        clips_meta = []
-        for s in segments:
-            if any(w in s.text.lower() for w in viral_triggers):
-                clips_meta.append({"start": max(0, s.start - 1.5), "end": s.start + clip_len, "text": s.text.strip()})
-        
-        clips_meta = clips_meta[:max_count]
-        
-        # 4. НАРЕЗКА
-        if os.path.exists(CLIPS): shutil.rmtree(CLIPS)
-        os.makedirs(CLIPS)
+# --- ЭТАП 1: ТРАНСКРИБАЦИЯ ---
+if st.button("🔍 ЭТАП 1: ПОЛУЧИТЬ ТЕКСТ"):
+    if uploaded_file or url:
+        with st.spinner("Загрузка и распознавание..."):
+            # Загрузка
+            if uploaded_file:
+                with open(VIDEO_PATH, "wb") as f: f.write(uploaded_file.getbuffer())
+            else:
+                ydl_opts = {'format': 'best[ext=mp4]', 'outtmpl': VIDEO_PATH, 'quiet': True}
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl: ydl.download([url])
 
-        for i, meta in enumerate(clips_meta):
-            add_log(f"Создаю клип {i+1}...")
-            update_console()
-            out_path = f"{CLIPS}/clip_{i}.mp4"
-            clean_text = meta['text'].replace("'", "").upper()
-            cmd = [
-                "ffmpeg", "-ss", str(meta['start']), "-t", str(meta['end'] - meta['start']), "-i", VIDEO,
-                "-vf", f"crop=ih*9/16:ih,drawtext=text='{clean_text}':fontcolor=yellow:fontsize=40:borderw=2:x=(w-text_w)/2:y=h-150",
-                "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", out_path, "-y"
-            ]
-            subprocess.run(cmd, check=True, capture_output=True)
+            # Распознавание
+            model = WhisperModel("base", device="cpu", compute_type="int8")
+            segments, _ = model.transcribe(VIDEO_PATH)
+            full_text = " ".join([seg.text for seg in segments])
             
-        add_log("✨ ВСЕ ГОТОВО!")
-        update_console()
-        
-    except Exception as e:
-        add_log(f"❌ ОШИБКА: {str(e)}")
-        update_console()
-
-# --- ИНТЕРФЕЙС ---
-
-with st.sidebar:
-    st.header("⚙️ Настройки")
-    clip_len = st.slider("Длина клипа", 5, 30, 15)
-    max_count = st.slider("Макс. клипов", 1, 10, 3)
-    u_prompt = st.text_input("О чем видео?", "блог, юмор, подкаст")
-    
-    st.divider()
-    if st.button("🗑️ ОЧИСТИТЬ ВСЕ РЕЗУЛЬТАТЫ", use_container_width=True):
-        if os.path.exists(CLIPS): shutil.rmtree(CLIPS)
-        if os.path.exists(VIDEO): os.remove(VIDEO)
-        if os.path.exists(AUDIO): os.remove(AUDIO)
-        st.session_state.logs = "=== Система очищена ===\n"
-        st.rerun()
-
-st.title("🎬 AI Viral Generator")
-url = st.text_input("Вставьте ссылку на YouTube", placeholder="https://www.youtube.com/watch?v=...")
-
-if st.button("🚀 СОЗДАТЬ КЛИПЫ", use_container_width=True, type="primary"):
-    if url:
-        start_full_process(url, clip_len, max_count, u_prompt)
+            # Перевод
+            translator = GoogleTranslator(source='auto', target=target_lang)
+            st.session_state.translated_text = translator.translate(full_text)
+            st.success("Текст готов для редактирования!")
     else:
-        st.error("Сначала вставьте ссылку!")
+        st.warning("Сначала загрузите видео!")
 
-# ВЫВОД КЛИПОВ
-if os.path.exists(CLIPS) and os.listdir(CLIPS):
-    st.divider()
-    st.subheader("📺 Готовые клипы")
-    files = sorted([f for f in os.listdir(CLIPS) if f.endswith(".mp4")])
-    cols = st.columns(2)
-    for idx, f in enumerate(files):
-        with cols[idx % 2]:
-            path = os.path.join(CLIPS, f)
-            st.video(path)
-            with open(path, "rb") as bfile:
-                st.download_button(f"Скачать {f}", bfile, file_name=f, key=f"btn_{f}")
+# --- ПОЛЕ РЕДАКТИРОВАНИЯ ---
+st.session_state.translated_text = st.text_area(
+    "Отредактируйте текст перевода здесь перед озвучкой:", 
+    value=st.session_state.translated_text, 
+    height=250
+)
+
+# --- ЭТАП 2: ГЕНЕРАЦИЯ ---
+if st.button("🚀 ЭТАП 2: СКЛЕИТЬ ВИДЕО С ЭТИМ ТЕКСТОМ"):
+    if not st.session_state.translated_text:
+        st.error("Нет текста для озвучки! Сначала выполните Этап 1 или введите текст вручную.")
+    elif not os.path.exists(VIDEO_PATH):
+        st.error("Файл видео не найден. Загрузите его снова.")
+    else:
+        try:
+            # 1. Озвучка
+            with st.spinner("Создание нейронного голоса..."):
+                rate = f"{speed-100:+d}%"
+                communicate = edge_tts.Communicate(st.session_state.translated_text, VOICE_DATA[target_lang][gender], rate=rate)
+                asyncio.run(communicate.save(VOICEOVER_PATH))
+
+            # 2. Монтаж
+            with st.spinner("Сборка финального видео..."):
+                video = VideoFileClip(VIDEO_PATH)
+                new_audio = AudioFileClip(VOICEOVER_PATH)
+                
+                final_video = video.with_audio(new_audio)
+                final_video.write_videofile(RESULT_PATH, codec="libx264", audio_codec="aac", fps=24)
+                
+                st.success("🔥 ГОТОВО!")
+                st.video(RESULT_PATH)
+                
+                with open(RESULT_PATH, "rb") as f:
+                    st.download_button("📥 Скачать результат", f, "dubbed_video.mp4")
+                
+                video.close()
+                new_audio.close()
+        except Exception as e:
+            st.error(f"Ошибка: {e}")
